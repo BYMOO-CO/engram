@@ -189,7 +189,7 @@ func TestCodexEndedSessionStart409DeniesWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	if err := db.CreateSession("host", "project-a", root); err != nil {
+	if err := db.CreateSessionWithOwnershipMode("host", "foreign-project", root, store.SessionOwnershipProjectOwned); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.EndSession("host", "finished"); err != nil {
@@ -204,6 +204,10 @@ func TestCodexEndedSessionStart409DeniesWrite(t *testing.T) {
 		}
 		if r.URL.Path == "/context" {
 			_, _ = w.Write([]byte(`{"context":""}`))
+			return
+		}
+		if r.URL.Path == "/runtime-sessions/resolve" {
+			production.ServeHTTP(w, r)
 			return
 		}
 		if r.URL.Path != "/sessions" || r.Method != http.MethodPost {
@@ -223,6 +227,7 @@ func TestCodexEndedSessionStart409DeniesWrite(t *testing.T) {
 		_, _ = w.Write(capture.Body.Bytes())
 	}))
 	defer endpoint.Close()
+	codexTestHookBinary(t, root)
 	input, _ := json.Marshal(map[string]string{"session_id": "host", "cwd": root})
 	command := exec.Command("bash", filepath.Join("..", "..", "plugin", "codex", "scripts", "session-start.sh"))
 	command.Stdin = strings.NewReader(string(input))
@@ -266,7 +271,7 @@ func TestCodexCallConfirmsSharedHostBeforeBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	production := server.New(db, 0).Handler()
-	registrations := 0
+	confirmations := 0
 	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/project/current" {
 			if r.URL.Query().Get("cwd") != filepath.ToSlash(root) {
@@ -275,7 +280,7 @@ func TestCodexCallConfirmsSharedHostBeforeBinding(t *testing.T) {
 			_, _ = w.Write([]byte(`{"project":"project-b","project_source":"config"}`))
 			return
 		}
-		if r.URL.Path != "/sessions" || r.Method != http.MethodPost {
+		if r.URL.Path != "/runtime-sessions/resolve" || r.Method != http.MethodPost {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
 			w.WriteHeader(404)
 			return
@@ -305,10 +310,10 @@ func TestCodexCallConfirmsSharedHostBeforeBinding(t *testing.T) {
 		if err := json.Unmarshal(capture.Body.Bytes(), &confirmation); err != nil {
 			t.Error(err)
 		}
-		if capture.Code != http.StatusCreated || confirmation.ID != "host" || confirmation.Status != "created" {
+		if capture.Code != http.StatusOK || confirmation.ID != "host" || confirmation.Status != "resolved" {
 			t.Errorf("registration response: %d %s", capture.Code, capture.Body.String())
 		}
-		registrations++
+		confirmations++
 		w.WriteHeader(capture.Code)
 		_, _ = w.Write(capture.Body.Bytes())
 	}))
@@ -324,8 +329,8 @@ func TestCodexCallConfirmsSharedHostBeforeBinding(t *testing.T) {
 	if err := json.Unmarshal(guardCodexPreToolUse(input), &result); err != nil {
 		t.Fatal(err)
 	}
-	if registrations != 1 || result.HookSpecificOutput.PermissionDecision != "allow" || result.HookSpecificOutput.UpdatedInput["session_id"] != "host" || result.HookSpecificOutput.UpdatedInput["project"] != "project-b" {
-		t.Fatalf("registrations=%d result=%+v", registrations, result)
+	if confirmations != 1 || result.HookSpecificOutput.PermissionDecision != "allow" || result.HookSpecificOutput.UpdatedInput["session_id"] != "host" || result.HookSpecificOutput.UpdatedInput["project"] != "project-b" {
+		t.Fatalf("confirmations=%d result=%+v", confirmations, result)
 	}
 	call, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]any{"name": "mem_save", "arguments": result.HookSpecificOutput.UpdatedInput}})
 	mcpResult := mcp.NewServerWithConfig(db, mcp.MCPConfig{DefaultProject: "project-a"}, nil).HandleMessage(context.Background(), call)
@@ -500,7 +505,10 @@ func TestHookSessionConfirmationLatency(t *testing.T) {
 					switch r.URL.Path {
 					case "/project/current":
 						gets.Add(1)
-					case "/sessions":
+					case "/sessions", "/runtime-sessions/resolve":
+						if (r.URL.Path == "/sessions") != (agent == "claude") {
+							t.Errorf("unexpected agent endpoint: %s", r.URL.Path)
+						}
 						posts.Add(1)
 						delay = tc.register
 						var registration map[string]string
@@ -529,6 +537,10 @@ func TestHookSessionConfirmationLatency(t *testing.T) {
 						return
 					}
 					registrations.Add(1)
+					if agent == "codex" {
+						_, _ = io.WriteString(w, `{"id":"host","status":"resolved"}`)
+						return
+					}
 					w.WriteHeader(http.StatusCreated)
 					_, _ = io.WriteString(w, `{"id":"host","status":"created"}`)
 				}))
@@ -613,7 +625,10 @@ func TestHookSessionConfirmationSharedDeadline(t *testing.T) {
 						if r.Method != http.MethodGet || r.URL.Query().Get("cwd") != "/work" {
 							t.Fatalf("unexpected project request: %s %s", r.Method, r.URL)
 						}
-					case "/sessions":
+					case "/sessions", "/runtime-sessions/resolve":
+						if (r.URL.Path == "/sessions") != (agent == "claude") {
+							t.Fatalf("unexpected agent endpoint: %s", r.URL.Path)
+						}
 						posts++
 						if r.Context() != projectContext || time.Since(started) != 2100*time.Millisecond {
 							t.Fatal("registration did not start after lookup with the same context")
@@ -1198,8 +1213,8 @@ func TestCodexPreToolUseCommandWritesAllowAndBoundInput(t *testing.T) {
 			_, _ = w.Write([]byte(`{"project":"project-a","project_source":"config"}`))
 			return
 		}
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"id":"host","status":"created"}`))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"host","status":"resolved"}`))
 	}))
 	defer endpoint.Close()
 	t.Setenv("ENGRAM_URL", endpoint.URL)

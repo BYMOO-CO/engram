@@ -6,11 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -53,6 +51,10 @@ var claudeHookOutput = func(response []byte) error {
 }
 
 func cmdHook(args []string) {
+	if len(args) == 1 && (args[0] == "codex-register" || args[0] == "codex-resolve" || args[0] == "codex-session-end") {
+		cmdCodexLifecycle(args[0])
+		return
+	}
 	if len(args) == 1 && args[0] == "codex-user-prompt-submit" {
 		cmdCodexUserPromptSubmit()
 		return
@@ -112,26 +114,10 @@ func hookSessionConfirmationDeny(agent string, err error) []byte {
 }
 
 func confirmHookSession(id, cwd string, projectOwned bool) (confirmationErr error) {
-	base := strings.TrimSpace(os.Getenv("ENGRAM_URL"))
-	client := &http.Client{}
+	base, client := hookEndpointClient("")
 	if base == "" {
-		if socket := strings.TrimSpace(os.Getenv("ENGRAM_SOCKET")); socket != "" {
-			base = "http://localhost"
-			client.Transport = &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", socket)
-			}}
-		} else {
-			port := strings.TrimSpace(os.Getenv("ENGRAM_PORT"))
-			n, err := strconv.Atoi(port)
-			if port == "" {
-				n = 7437
-			} else if err != nil || n < 1 || n > 65535 {
-				return errHookSessionUnconfirmed
-			}
-			base = fmt.Sprintf("http://127.0.0.1:%d", n)
-		}
+		return errHookSessionUnconfirmed
 	}
-	base = strings.TrimRight(base, "/")
 	ctx, cancel := context.WithTimeout(context.Background(), hookSessionConfirmationTimeout)
 	defer func() {
 		// Preserve timeout information even when a transport/JSON helper returns
@@ -235,15 +221,23 @@ func guardCodexPreToolUse(input []byte) []byte {
 	if !isClaudeEngramWriteOrSessionTool(tool) {
 		return transformCodexPreToolUse(input)
 	}
-	id, idOK := claudeHookRequiredString(payload, "session_id")
-	cwd, cwdOK := claudeHookRequiredString(payload, "cwd")
+	_, idOK := claudeHookRequiredString(payload, "session_id")
+	_, cwdOK := claudeHookRequiredString(payload, "cwd")
 	if !idOK || !cwdOK {
-		return claudePreToolUseDeny("Codex " + errHookSessionUnconfirmed.Error())
+		return claudePreToolUseDeny("Codex host session resolution could not be confirmed")
 	}
-	if err := confirmHookSession(id, cwd, false); err != nil {
-		return hookSessionConfirmationDeny("Codex", err)
+	ctx, cancel := context.WithTimeout(context.Background(), hookSessionConfirmationTimeout)
+	defer cancel()
+	effective := runCodexLifecycleContext(ctx, "codex-resolve", input, codexHookURL())
+	if effective == "" {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return hookSessionConfirmationDeny("Codex", ctx.Err())
+		}
+		return claudePreToolUseDeny("Codex host session resolution could not be confirmed")
 	}
-	return transformCodexPreToolUse(input)
+	payload["session_id"], _ = json.Marshal(effective)
+	bound, _ := json.Marshal(payload)
+	return transformCodexPreToolUse(bound)
 }
 
 // Codex requires an explicit allow alongside updatedInput for MCP argument rewrites.
