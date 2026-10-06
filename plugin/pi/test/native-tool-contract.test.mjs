@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { createInterface } from "node:readline";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -2896,6 +2898,210 @@ test("hosts without mapping persistence never request core resume", async () => 
   } finally {
     globalThis.fetch = originalFetch;
     if (originalUrl === undefined) delete process.env.ENGRAM_URL; else process.env.ENGRAM_URL = originalUrl;
+  }
+});
+
+test("session registration trace is opt-in, metadata-only, and preserves resume behavior", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrl = process.env.ENGRAM_URL;
+  const originalTrace = process.env.ENGRAM_PI_SESSION_TRACE;
+  const originalWrite = process.stderr.write;
+  const originalDescriptorWrite = fs.writeSync;
+  process.env.ENGRAM_URL = "http://127.0.0.1:17437";
+  try {
+    for (const scenario of ["disabled", "appendEntry", "getBranch", "resume", "retry"]) {
+      const enabled = scenario !== "disabled";
+      if (enabled) process.env.ENGRAM_PI_SESSION_TRACE = "1";
+      else delete process.env.ENGRAM_PI_SESSION_TRACE;
+      const stderr = [];
+      const registrations = [];
+      const writes = [];
+      const entries = [];
+      const runtimeID = `private-runtime-${scenario}`;
+      const effectiveID = `${runtimeID}:resume:2`;
+      const canPersist = !["appendEntry", "getBranch"].includes(scenario);
+      process.stderr.write = (chunk) => { stderr.push(String(chunk)); return true; };
+      fs.writeSync = (fd, ...args) => {
+        if (fd !== 2) return originalDescriptorWrite(fd, ...args);
+        stderr.push(String(args[0])); return Buffer.byteLength(String(args[0]));
+      };
+      syncBuiltinESMExports();
+      globalThis.fetch = async (url, init = {}) => {
+        const path = new URL(url).pathname;
+        const body = init.body ? JSON.parse(init.body) : undefined;
+        if (path === "/project/current") return new Response('{"project":"private-project"}');
+        if (path === "/health") return new Response('{"version":"3.0.0","capabilities":{"root_session_resume":true}}');
+        if (path === "/sessions") {
+          registrations.push(body);
+          if (scenario === "retry" && registrations.length === 1) throw new Error("private transport detail");
+          if (!body.resume) return new Response(JSON.stringify({ code: "session_already_ended", error: "session has already ended", session_id: runtimeID }), { status: 409 });
+          return new Response(JSON.stringify({ id: effectiveID, status: "created" }));
+        }
+        if (path === "/observations") writes.push(body);
+        return new Response('{"id":1}');
+      };
+      await withPluginSandbox("engram-pi-session-trace-", async ({ sandbox }) => {
+        const append = scenario === "appendEntry" ? undefined : (customType, data) => entries.push({ type: "custom", customType, data });
+        const { registeredTools } = await loadPluginHarness(sandbox, append);
+        const ctx = runtimeContext(runtimeID);
+        if (scenario !== "getBranch") ctx.sessionManager.getBranch = () => entries;
+        const result = await registeredTools.get("mem_save").execute("trace", { title: "private title", content: "private content" }, undefined, undefined, ctx);
+        assert.equal(result.isError, canPersist ? undefined : true);
+        if (!canPersist) assert.equal(result.details.data?.code, "session_already_ended");
+        assert.equal(registrations.length, scenario === "retry" ? 2 : 1);
+        assert.ok(registrations.every((body) => body.resume === canPersist));
+        assert.equal(writes.length, canPersist ? 1 : 0);
+        if (canPersist) assert.equal(writes[0].session_id, effectiveID);
+        assert.equal(entries.length, canPersist ? 1 : 0);
+        const lines = stderr.filter((line) => line.startsWith("[engram:session-trace] "));
+        if (!enabled) assert.deepEqual(lines, []);
+        else {
+          const events = lines.map((line) => JSON.parse(line.slice("[engram:session-trace] ".length)));
+          assert.deepEqual(events, [
+            { stage: "context", append_entry: scenario !== "appendEntry", get_branch: scenario !== "getBranch", persisted: "root" },
+            ...registrations.map(() => ({ stage: "dispatch", requested: "root", resume: canPersist })),
+            canPersist ? { stage: "acknowledgement", effective: "continuation" }
+              : { stage: "rejection", http_status: 409, reason: "session_already_ended" },
+            ...(canPersist ? [{ stage: "adoption", effective: "continuation" }] : []),
+          ]);
+          assert.doesNotMatch(lines.join(""), /private|\/|session_id|title|content/);
+        }
+      });
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.stderr.write = originalWrite;
+    fs.writeSync = originalDescriptorWrite;
+    syncBuiltinESMExports();
+    if (originalUrl === undefined) delete process.env.ENGRAM_URL; else process.env.ENGRAM_URL = originalUrl;
+    if (originalTrace === undefined) delete process.env.ENGRAM_PI_SESSION_TRACE; else process.env.ENGRAM_PI_SESSION_TRACE = originalTrace;
+  }
+});
+
+test("session lifecycle trace is private, opt-in, and preserves shutdown behavior", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrl = process.env.ENGRAM_URL;
+  const originalTrace = process.env.ENGRAM_PI_SESSION_TRACE;
+  const originalWrite = process.stderr.write;
+  const originalDescriptorWrite = fs.writeSync;
+  process.env.ENGRAM_URL = "http://127.0.0.1:17437";
+  try {
+    for (const mode of ["enabled", "disabled", "broken-stderr"]) {
+      process.env.ENGRAM_PI_SESSION_TRACE = mode === "disabled" ? "0" : "1";
+      const stderr = [];
+      const calls = [];
+      process.stderr.write = (chunk) => {
+        if (mode === "broken-stderr") throw new Error("private stderr failure");
+        stderr.push(String(chunk)); return true;
+      };
+      fs.writeSync = (fd, ...args) => {
+        if (fd !== 2) return originalDescriptorWrite(fd, ...args);
+        if (mode === "broken-stderr") throw new Error("private stderr failure");
+        stderr.push(String(args[0])); return Buffer.byteLength(String(args[0]));
+      };
+      syncBuiltinESMExports();
+      globalThis.fetch = async (url, init = {}) => {
+        const path = new URL(url).pathname;
+        calls.push(path);
+        if (path === "/project/current") return new Response('{"project":"pi"}');
+        if (path === "/health") return new Response('{"version":"3.0.0"}');
+        if (path === "/sessions") return new Response(JSON.stringify({ id: JSON.parse(init.body).id, status: "created" }));
+        return new Response('{"id":1,"status":"ended"}');
+      };
+      await withPluginSandbox("engram-pi-lifecycle-trace-", async ({ sandbox }) => {
+        const { registeredTools, eventHandlers } = await loadPluginHarness(sandbox);
+        const start = eventHandlers.get("session_start");
+        const shutdown = eventHandlers.get("session_shutdown");
+        const alpha = runtimeContext("private-alpha");
+        const beta = runtimeContext("private-beta");
+        const save = async (ctx) => {
+          const result = await registeredTools.get("mem_save").execute("trace", { title: "private title", content: "private content" }, undefined, undefined, ctx);
+          assert.equal(result.isError, undefined);
+        };
+        await start({}, alpha); await save(alpha);
+        await shutdown({ reason: "reload" }, alpha);
+        assert.equal(calls.filter((path) => path.endsWith("/end")).length, 0);
+        await start({}, alpha); await save(alpha);
+        await shutdown({ reason: "private arbitrary reason" }, alpha);
+        assert.equal(calls.filter((path) => path.endsWith("/end")).length, 1);
+        await start({}, beta); await save(beta);
+        await shutdown({}, beta);
+        await shutdown({}, runtimeContext(""));
+        await shutdown({ reason: "reload" }, runtimeContext(() => { throw new Error("private identity failure"); }));
+        assert.equal(calls.filter((path) => path === "/observations").length, 3);
+        assert.equal(calls.filter((path) => path.endsWith("/end")).length, 2);
+        const events = stderr.filter((line) => line.startsWith("[engram:session-trace] "))
+          .map((line) => JSON.parse(line.slice("[engram:session-trace] ".length)));
+        assert.deepEqual(events.filter(({ stage }) => stage === "lifecycle"), mode === "enabled" ? [
+          { stage: "lifecycle", event: "session_start", identity: "first" },
+          { stage: "lifecycle", event: "session_shutdown", reason: "reload", identity: "same" },
+          { stage: "lifecycle", event: "session_start", identity: "same" },
+          { stage: "lifecycle", event: "session_shutdown", reason: "other", identity: "same" },
+          { stage: "lifecycle", event: "session_start", identity: "different" },
+          { stage: "lifecycle", event: "session_shutdown", reason: "missing", identity: "same" },
+          { stage: "lifecycle", event: "session_shutdown", reason: "missing", identity: "missing" },
+          { stage: "lifecycle", event: "session_shutdown", reason: "reload", identity: "missing" },
+        ] : []);
+        assert.doesNotMatch(stderr.join(""), /private|arbitrary|\/|title|content/);
+      });
+    }
+  } finally {
+    globalThis.fetch = originalFetch; process.stderr.write = originalWrite;
+    fs.writeSync = originalDescriptorWrite;
+    syncBuiltinESMExports();
+    if (originalUrl === undefined) delete process.env.ENGRAM_URL; else process.env.ENGRAM_URL = originalUrl;
+    if (originalTrace === undefined) delete process.env.ENGRAM_PI_SESSION_TRACE; else process.env.ENGRAM_PI_SESSION_TRACE = originalTrace;
+  }
+});
+
+test("session trace survives a closed stderr pipe without changing host error handling", async () => {
+  for (const hostHandler of [false, true]) {
+    await withPluginSandbox("engram-pi-closed-trace-pipe-", async ({ sandbox }) => {
+      const script = `
+        import { importPluginFromSandbox } from ${JSON.stringify(new URL("./plugin-sandbox.mjs", import.meta.url).href)};
+        const handlers = new Map();
+        const register = await importPluginFromSandbox(${JSON.stringify(sandbox)});
+        register({ registerTool() {}, on(event, handler) { handlers.set(event, handler); } });
+        let hostErrors = 0;
+        if (${hostHandler}) process.stderr.on('error', () => { hostErrors++; });
+        const listeners = process.stderr.listenerCount('error');
+        let requests = 0;
+        globalThis.fetch = async () => { requests++; throw new Error('unexpected request'); };
+        process.stdout.write('ready\\n');
+        await new Promise(resolve => process.stdin.once('data', resolve));
+        await handlers.get('session_shutdown')({ reason: 'reload' }, {
+          sessionManager: { getSessionId: () => 'synthetic-session' },
+        });
+        process.stdin.pause();
+        await new Promise(resolve => setImmediate(resolve));
+        process.stdout.write(JSON.stringify({ listeners, remaining: process.stderr.listenerCount('error'), hostErrors, requests }) + '\\n');
+      `;
+      const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+        env: { ...process.env, ENGRAM_PI_SESSION_TRACE: "1" },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      const ready = deferred();
+      const closed = deferred();
+      const exited = deferred();
+      const output = [];
+      const lines = createInterface({ input: child.stdout });
+      lines.on("line", (line) => { output.push(line); if (line === "ready") ready.resolve(); });
+      child.stderr.once("close", () => closed.resolve());
+      child.once("exit", (code, signal) => exited.resolve({ code, signal }));
+      child.once("error", (error) => exited.resolve({ error }));
+      try {
+        await waitFor(ready.promise, "child did not prepare the trace");
+        child.stderr.destroy();
+        await waitFor(closed.promise, "stderr reader did not close");
+        child.stdin.end("trace\n");
+        const result = await waitFor(exited.promise, "child did not exit after the trace");
+        assert.deepEqual(result, { code: 0, signal: null });
+        assert.deepEqual(output, ["ready", JSON.stringify({ listeners: hostHandler ? 1 : 0, remaining: hostHandler ? 1 : 0, hostErrors: 0, requests: 0 })]);
+      } finally {
+        child.kill();
+        lines.close();
+      }
+    });
   }
 });
 
