@@ -1035,7 +1035,8 @@ const realm = globalThis as typeof globalThis & { [shutdownFlightsKey]?: WeakMap
 const shutdownFlights = realm[shutdownFlightsKey] ??= new WeakMap<object, Map<string, Promise<void>>>();
 const lifecycleKey = Symbol.for("engram.pi.session-lifecycle");
 type Lifecycle = { epoch: number; closing: boolean; confirmedShutdownID?: string; removeBridgeResponder?: () => void;
-  promptTurn?: number; promptProof?: { digest: string; project: string; effectiveID: string } };
+  awaitingInitialUserMessage?: boolean; promptTurn?: number; promptProof?: { digest: string; project: string; effectiveID: string };
+  currentPrompt?: { content: string; project: string; effectiveID: string } };
 const lifecycleRealm = globalThis as typeof globalThis & { [lifecycleKey]?: WeakMap<object, Map<string, Lifecycle>> };
 const lifecycles = lifecycleRealm[lifecycleKey] ??= new WeakMap<object, Map<string, Lifecycle>>();
 function lifecycle(ctx: SessionContext, id: string): Lifecycle {
@@ -1635,7 +1636,7 @@ const MEMORY_TOOL_SCHEMAS: Record<string, ReturnType<typeof Type.Object>> = {
     topic_key: optionalString("Stable topic key for upserts"),
     project: optionalString("Optional explicit project"),
     cwd: optionalString("Optional directory whose Engram project receives this write; must agree with project when both are set"),
-    capture_prompt: optionalBoolean("Capture current prompt when available"),
+    capture_prompt: optionalBoolean("Capture the available session/project prompt for this save (default true); does not disable lifecycle capture"),
   }),
   mem_update: Type.Object({
     id: Type.Number({ description: "Observation ID to update" }),
@@ -1804,6 +1805,7 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
   const runtimeSessionForWrite = () => requireRuntimeSessionID(ctx);
   const writeState = sessionId ? lifecycle(ctx, sessionId) : undefined;
   const writeEpoch = writeState?.epoch;
+  const currentPrompt = writeState?.currentPrompt;
   const writeTarget = WRITE_TARGET_TOOLS.has(toolName) ? await resolveExplicitWriteTarget(params, fetch) : undefined;
   const requestedProject = writeTarget?.project || (typeof params.project === "string" && params.project ? params.project : undefined);
   const activeProject = requestedProject || project;
@@ -1857,6 +1859,11 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
           project: activeProject,
           scope: params.scope || "project",
           topic_key: params.topic_key,
+          capture_prompt: params.capture_prompt,
+          current_prompt: params.capture_prompt !== false && currentPrompt
+            && writeState?.currentPrompt === currentPrompt
+            && currentPrompt.project === activeProject && currentPrompt.effectiveID === activeSessionId
+            ? currentPrompt.content : undefined,
         },
       });
     }
@@ -2128,6 +2135,8 @@ function removeBridgeResponders(ctx: SessionContext): void {
     state.removeBridgeResponder?.();
     state.removeBridgeResponder = undefined;
     state.promptProof = undefined;
+    state.currentPrompt = undefined;
+    state.awaitingInitialUserMessage = false;
     state.promptTurn = (state.promptTurn || 0) + 1;
   }
 }
@@ -2223,6 +2232,24 @@ export default function registerEngram(pi: ExtensionAPI) {
     if (sessionId) pendingInput.set(ctx.sessionManager, { sessionId, source: event.source });
     else pendingInput.delete(ctx.sessionManager);
     return { action: "continue" as const };
+  });
+  pi.on("message_start", (event: { message?: { role?: string } }, ctx: SessionContext) => {
+    if (event.message?.role !== "user") return;
+    const sessionId = observeRuntimeSessionID(ctx);
+    for (const [runtimeID, state] of lifecycles.get(ctx.sessionManager) || []) {
+      if (sessionId && sessionId !== runtimeID) continue;
+      if (sessionId === runtimeID && !state.closing && state.awaitingInitialUserMessage) {
+        // agent.prompt emits the first user message after before_agent_start.
+        state.awaitingInitialUserMessage = false;
+        continue;
+      }
+      // Later user messages are consumed queued turns, not enqueue notifications.
+      // Never inspect their content or inherit the preceding native turn's proof.
+      state.awaitingInitialUserMessage = false;
+      state.currentPrompt = undefined;
+      state.promptProof = undefined;
+      state.promptTurn = (state.promptTurn || 0) + 1;
+    }
   });
   pi.on("session_start", async (_event: unknown, ctx: SessionContext) => {
     pendingInput.delete(ctx.sessionManager);
@@ -2353,10 +2380,13 @@ export default function registerEngram(pi: ExtensionAPI) {
     // Invalidate before any initialization or early return, including short/empty turns.
     for (const prior of lifecycles.get(ctx.sessionManager)?.values() || []) {
       prior.promptProof = undefined;
+      prior.currentPrompt = undefined;
+      prior.awaitingInitialUserMessage = false;
       prior.promptTurn = (prior.promptTurn || 0) + 1;
     }
     let systemPrompt = event.systemPrompt.length > 0 ? `${event.systemPrompt}\n\n${MEMORY_INSTRUCTIONS}` : MEMORY_INSTRUCTIONS;
     const state = sessionId ? lifecycle(ctx, sessionId) : undefined;
+    if (state) state.awaitingInitialUserMessage = true;
     const epoch = state?.epoch;
     const promptTurn = state?.promptTurn;
     // A returned systemPrompt becomes a forced prompt that turns skipping this hook never see
@@ -2392,7 +2422,13 @@ export default function registerEngram(pi: ExtensionAPI) {
         content: truncate(stripPrivateTags(finalContent), 2000),
         project,
       };
-      if (state && (state.closing || state.epoch !== epoch)) return result;
+      if (state && (state.closing || state.epoch !== epoch || state.promptTurn !== promptTurn)) return result;
+      // Retain only the already-redacted payload, scoped to the current owner.
+      // Go owns per-save opt-out and dedupe, including recovery after a failed lifecycle write.
+      if (state && getSessionId(ctx) === sessionId && project === body.project
+        && !projectDetectionPending && !projectResolutionError) {
+        state.currentPrompt = { content: body.content, project: body.project, effectiveID };
+      }
       const acknowledgement = await bestEffortEngramFetch<{ id?: unknown; status?: unknown }>("/prompts", { method: "POST", body }, ctx);
       // null includes errors and successful JSON null/204: only the core's saved-ID
       // acknowledgement proves capture. The digest matches the original trimmed input,
