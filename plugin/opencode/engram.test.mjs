@@ -1311,6 +1311,53 @@ test("chat.message resolves an unobserved child and skips its prompt", async (t)
   assert.equal(runtime.requests.some(({ path }) => path === "/prompts"), false)
 })
 
+for (const tool of ["task", "Task"]) {
+  test(`delegation passive capture accepts ${tool} and preserves the payload`, async (t) => {
+    const runtime = await createRuntime(t, { selectLegacyDefault: true })
+    const content = "## Key Learnings:\n- Delegation output should be captured for the acknowledged root session."
+    await runtime.after({ tool, sessionID: "runtime" }, content)
+
+    assert.deepEqual(runtime.requests.filter(({ path }) => path === "/observations/passive"), [{
+      path: "/observations/passive",
+      url: "http://127.0.0.1:7437/observations/passive",
+      method: "POST",
+      body: { session_id: "runtime", content, project: "engram", source: "task-complete" },
+    }])
+    await runtime.after({ tool: "read", sessionID: "runtime" }, content)
+    assert.equal(runtime.requests.filter(({ path }) => path === "/observations/passive").length, 1,
+      "non-delegation tool output must remain excluded")
+  })
+}
+
+test("V1 delegation passive capture extracts text from the tool result object", async (t) => {
+  const runtime = await createRuntime(t, { selectLegacyDefault: true })
+  const content = "## Key Learnings:\n- The task result text must reach passive capture without wrapper metadata."
+  const output = { title: "Delegated task", output: content, metadata: { task_id: "child" } }
+  await runtime.after({ tool: "task", sessionID: "runtime" }, output)
+
+  assert.deepEqual(runtime.requests.filter(({ path }) => path === "/observations/passive"), [{
+    path: "/observations/passive",
+    url: "http://127.0.0.1:7437/observations/passive",
+    method: "POST",
+    body: { session_id: "runtime", content, project: "engram", source: "task-complete" },
+  }])
+  assert.deepEqual(output, { title: "Delegated task", output: content, metadata: { task_id: "child" } },
+    "capture must not mutate the tool result")
+})
+
+test("delegation passive capture preserves JSON fallback for other result shapes", async (t) => {
+  const runtime = await createRuntime(t, { selectLegacyDefault: true })
+  const output = { content: "A reusable delegation learning that exceeds the passive capture length threshold." }
+  await runtime.after({ tool: "task", sessionID: "runtime" }, output)
+
+  assert.deepEqual(runtime.requests.filter(({ path }) => path === "/observations/passive"), [{
+    path: "/observations/passive",
+    url: "http://127.0.0.1:7437/observations/passive",
+    method: "POST",
+    body: { session_id: "runtime", content: JSON.stringify(output), project: "engram", source: "task-complete" },
+  }])
+})
+
 test("Task passive capture resolves an unobserved child and attributes the root", async (t) => {
   const runtime = await createRuntime(t, { sessionGet: sdkLookup(CHILD_SESSIONS) })
   await runtime.after({ tool: "Task", sessionID: "leaf" }, "A".repeat(60))
